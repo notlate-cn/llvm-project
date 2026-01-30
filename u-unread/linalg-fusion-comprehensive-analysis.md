@@ -368,11 +368,12 @@ for (unsigned i = 0, e = producer.getNumLoops(); i < e; ++i) {
 
   // 获取这个维度的实际大小
   // createFoldedDimOp(b, loc, %A, 0) 返回 %A 第 0 维的大小，即 128
+  // 生成结果类似：%dim = tensor.dim %A, %c0
   OpFoldResult dim = createFoldedDimOp(b, loc, shapeDim.shape,
                                        shapeDim.dimension);
   sizeBounds.push_back(dim);  // 第一次循环：sizeBounds = [128]
 
-  // 检查这个循环是否要被平铺（融合）
+  // 检查这个循环是否要被融合
   auto it = fusedLoopsAndRanges.find(i);
   // i = 0 时，it 指向 fusedLoopsAndRanges[0] = {offset: 32, size: 32, stride: 1}
   if (it != fusedLoopsAndRanges.end()) {
@@ -382,7 +383,7 @@ for (unsigned i = 0, e = producer.getNumLoops(); i < e; ++i) {
     loopRanges.push_back(it->second);     // loopRanges = [{32, 32, 1}]
   } else {
     // 未被融合的循环，使用完整范围
-    tileSizes.push_back(b.getIndexAttr(0));  // 0 表示不平铺
+    tileSizes.push_back(b.getIndexAttr(0));  // 0 表示不融合
     loopRanges.push_back(Range{b.getIndexAttr(0), dim,
                                 b.getIndexAttr(1)});
   }
@@ -397,7 +398,8 @@ for (unsigned i = 0, e = producer.getNumLoops(); i < e; ++i) {
 }
 
 // 循环结束后：
-// ivs = [32, 32]
+// 回顾本代码中第19行内容：只计算 [32:64][32:64] 这个 32x32 块，所以：
+// ivs = [32, 32] // ivs = induction variables（索引变量），存储每个循环的起始偏移量(i+32, j+32) 
 // tileSizes = [32, 32]
 // sizeBounds = [128, 128]
 // loopRanges = [{32, 32, 1}, {32, 32, 1}]
@@ -424,14 +426,17 @@ clonedShapes.append(makeTiledShapes(
 // ========== 步骤 3: 确定结果类型 ==========
 SmallVector<Type, 4> resultTypes;
 // producer->getNumResults() 返回 1（linalg.generic 有 1 个输出）
+resultTypes.reserve(producer->getNumResults());
+// firstInitOperandIdx = 1（因为 %A 是第 0 个操作数，%init 是第 1 个）
+int64_t firstInitOperandIdx =
+    producerDpsInits.getAsOperandRange().getBeginOperandIndex();
 for (int64_t i = 0, e = producer->getNumResults(); i < e; ++i) {
-  // i = 0, firstInitOperandIdx = 1（因为 %A 是第 0 个操作数，%init 是第 1 个）
-  // clonedShapes[1] = %init_tile，类型是 tensor<32x32xf32>
+  // i = 0, clonedShapes[1] = %init_tile，类型是 tensor<32x32xf32>
   resultTypes.push_back(clonedShapes[firstInitOperandIdx + i].getType());
 }
 // resultTypes = [tensor<32x32xf32>]
 
-// ========== 步骤 4: 克隆生产者 ==========
+// ========== 步骤 4: 克隆producer ==========
 LinalgOp clonedOp = clone(b, producer, resultTypes, clonedShapes);
 // clone 会复制原始操作的所有信息，并用新操作数替换旧操作数：
 // %1_tile = linalg.generic {
@@ -448,15 +453,77 @@ LinalgOp clonedOp = clone(b, producer, resultTypes, clonedShapes);
 // 现在 %1_tile 只计算 32x32 的块！
 
 // ========== 步骤 5: 调整索引偏移 ==========
+// offsetIndices 的具体作用：调整操作内部的 linalg.index 操作
+//
+// 什么是 linalg.index？
+//   在 linalg.generic 等操作内部，可以使用 linalg.index op 获取当前循环索引
+//   例如：%i = linalg.index 0  // 获取第 0 维的循环索引
+//
+// 举例说明问题：
+//   ========== 原始操作（计算整个 128x128）==========
+//   %1 = linalg.generic {
+//     indexing_maps = [affine_map<(i, j) -> (i, j)>,
+//                      affine_map<(i, j) -> (i, j)>]
+//     ins(%A : tensor<128x128xf32>)
+//     outs(%init : tensor<128x128xf32>) {
+//     ^bb0(%a: f32, %out: f32):
+//       %i = linalg.index 0  // 获取第 0 维索引，范围 [0, 128)
+//       %j = linalg.index 1  // 获取第 1 维索引，范围 [0, 128)
+//       // 假设有条件逻辑：只在 i > 64 时才计算
+//       %cond = arith.cmpi sgt, %i, %c64 : index
+//       %r = arith.select %cond, %a, %cst : f32
+//       linalg.yield %r
+//   }
+//
+//   ========== 融合后的问题（只计算 [32:64][32:64]）==========
+//   %1_tile = linalg.generic {
+//     ins(%A_tile : tensor<32x32xf32>)
+//     outs(%init_tile : tensor<32x32xf32>) {
+//     ^bb0(%a: f32, %out: f32):
+//       %i = linalg.index 0  // 问题：这里返回什么？
+//       %j = linalg.index 1  // 问题：这里返回什么？
+//       // 如果不调整，%i 仍然返回 [0, 32)，范围不对！
+//       // 原来的条件 "i > 64" 永远不会满足，逻辑就错了
+//       ...
+//   }
+//
+//   ========== offsetIndices 的修复 ==========
+//   offsetIndices 会做以下转换：
+//     %i = linalg.index 0
+//   -->
+//     %i_offset = arith.addi %i, %c32 : index
+//     // 然后把所有使用 %i 的地方替换为 %i_offset
+//
+//   修复后：
+//     ^bb0(%a: f32, %out: f32):
+//       %i_local = linalg.index 0        // 返回 [0, 32)，局部索引
+//       %i = arith.addi %i_local, %c32   // 返回 [32, 64)，全局索引
+//       %j_local = linalg.index 1
+//       %j = arith.addi %j_local, %c32
+//       // 现在条件 "i > 64" 可以正确判断了
+//       %cond = arith.cmpi sgt, %i, %c64 : index
+//       ...
+//
+//   ========== 源码分析 ==========
+//   for (IndexOp indexOp : linalgOp.getBlock()->getOps<IndexOp>()) {
+//     // 找到每个 linalg.index op
+//     // 例如：%i = linalg.index 0
+//
+//     OpFoldResult applied = makeComposedFoldedAffineApply(
+//         b, indexOp.getLoc(), index + offset,
+//         {indexOp.getResult(), offsets[indexOp.getDim()]});
+//     // 创建 affine_apply: %i + %c32
+//
+//     b.replaceUsesWithIf(indexOp, materialized, ...);
+//     // 把所有使用 %i 的地方替换为 (%i + 32)
+//   }
+
 SmallVector<OpFoldResult> allIvs = llvm::to_vector(
     llvm::map_range(loopRanges, [&](Range range) {
       return range.offset;  // 提取每个范围的偏移
     }));
 // allIvs = [32, 32]
 offsetIndices(b, clonedOp, allIvs);
-// offsetIndices 会调整操作内的索引映射
-// 因为我们是从 (32, 32) 开始计算的，内部索引需要正确映射
-// 确保在平铺后访问正确的内存位置
 
 return clonedOp;  // 返回融合后的操作 %1_tile
 ```
