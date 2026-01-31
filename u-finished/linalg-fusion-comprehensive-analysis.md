@@ -2,7 +2,7 @@
 
 ## 概述
 
-**Fusion（融合）** 是一种重要的编译器优化技术，通过将多个操作合并为一个操作来减少内存访问开销，提高数据局部性，并为后续优化（如向量化、并行化）创造机会。
+**Fusion** 是把多个操作合并成一个，减少内存读写。MLIR 的 Linalg 方言在 `mlir/lib/Dialect/Linalg/Transforms/` 下实现了多种融合策略。
 
 ### Fusion 相关文件
 
@@ -142,6 +142,21 @@ indexing_maps = [
 
 `Fusion.cpp` 实现了基于 `tensor::ExtractSliceOp` 的生产者-消费者融合，是 `tileAndFuse` 转换流程的核心部分。
 
+### TileAndFuse 工作流
+
+```
+1. Tiling 消费者操作
+   └─> 生成 extract_slice 操作
+
+2. 查找 extract_slice 的生产者
+   └─> 通过 getProducerOfTensor
+
+3. 融合生产者到消费者循环内
+   └─> 使用 fuseProducerOfTensor
+
+4. 重复直到没有更多可融合的操作
+```
+
 ---
 
 ### 核心数据结构
@@ -216,7 +231,7 @@ struct FusionInfo {
 
 #### 函数 1: getShapeDefiningLoopRange
 
-**问题**：给定一个循环层次（比如第 0 维循环 i），找出是哪个操作数的哪个维度决定了这个循环的范围？
+**作用**：给定一个循环层次（比如第 0 维循环 i），找出是哪个操作数的哪个维度决定了这个循环的范围？
 
 ```cpp
 static ShapeDimension getShapeDefiningLoopRange(
@@ -225,13 +240,13 @@ static ShapeDimension getShapeDefiningLoopRange(
     bool fromSubViewOpOnly = false)
 ```
 
-**代码执行解析**：
+**代码解读**：
 
 ```cpp
 // 以 完整计算图示例 中的 linalg.generic 为例介绍
 // 遍历所有操作数（输入 %A 和输出 %1）
 for (OpOperand &opOperand : op->getOpOperands()) {
-  // 如果要求必须来自 SubView/ExtractSlice，具体作用详见下方单独注释
+  // 如果要求必须来自 SubView/ExtractSlice，具体作用详见下方注释
   if (fromSubViewOpOnly &&
       !isa_and_nonnull<memref::SubViewOp, tensor::ExtractSliceOp>(
           opOperand.get().getDefiningOp()))
@@ -267,38 +282,87 @@ for (OpOperand &opOperand : op->getOpOperands()) {
 }
 ```
 
-**fromSubViewOpOnly的作用**
+**注解：fromSubViewOpOnly入参的两种应用场景**
 
 ```cpp
-// 参数 fromSubViewOpOnly = true 时的效果：
+// fromSubViewOpOnly 有两个重要的应用场景：
+//   = false: Consumer Tiling 时使用（获取完整迭代空间）
+//   = true:  Fuse Producer 时使用（获取 tile 后的局部范围）
 
-// ========== 场景 1: 操作数直接是张量 ==========
-%1 = linalg.generic ins(%A : tensor<128x128xf32>) outs(%init) { ... }
-// 当遍历到操作数 %A 时：
-//   %A.getDefiningOp() 返回 nullptr（%A 是函数参数，没有定义操作）
-//   isa_and_nonnull<...>(nullptr) 返回 false
-//   if 条件为 true，执行 continue，跳过 %A
+// ============================================================
+// 场景一：fromSubViewOpOnly = false
+// 用途：Consumer Tiling - 确定循环边界
+// ============================================================
 
-// ========== 场景 2: 操作数来自 ExtractSliceOp ==========
-%slice = tensor.extract_slice %A[32, 32][32, 32][1, 1]
-%1 = linalg.generic ins(%slice : tensor<32x32xf32>) outs(%init) { ... }
-// 当遍历到操作数 %slice 时：
-//   %slice.getDefiningOp() 返回 tensor::ExtractSliceOp
-//   isa_and_nonnull<ExtractSliceOp>(...) 返回 true
-//   if 条件为 false，不跳过，继续处理 %slice
+// 典型调用点（在 Tiling 实现中）：
+for (unsigned loopDepth = 0; loopDepth < numLoops; ++loopDepth) {
+  ShapeDimension shapeDim =
+      getShapeDefiningLoopRange(consumerOp, loopDepth,
+                                /*fromSubViewOpOnly=*/false);
+}
 
-// ========== 为什么要这样设计？==========
-// Fusion 流程中，只有通过 extract_slice/subview 获取的操作数
-// 才是"可以被融合的部分"，直接使用的张量（如函数参数）
-// 不应该被用来推断循环范围，因为它们可能是完整的张量，
-// 而不是已经 tile 过的切片。
+// 它回答的问题：
+//   "第 loopDepth 层循环的 range，应该用哪个 tensor 的哪个维度？"
+
+// 示例：
+%result = linalg.generic {
+  indexing_maps = [affine_map<(i, j) -> (i, j)>]
+  ins(%T : tensor<128x128xf32>)
+  outs(%output) { ... }
+
+// 调用 getShapeDefiningLoopRange(consumerOp, 0, false)
+// 返回：{shape: %T, dimension: 0}
+// 解释：第 0 层循环 i 的范围由 %T 的第 0 维决定
+//       i ∈ [0, 128)
+
+// 调用 getShapeDefiningLoopRange(consumerOp, 1, false)
+// 返回：{shape: %T, dimension: 1}
+// 解释：第 1 层循环 j 的范围由 %T 的第 1 维决定
+//       j ∈ [0, 128)
+
+// 结果：
+//   for i in [0, 128):     // 从 %T.dim[0] 获取
+//     for j in [0, 128):   // 从 %T.dim[1] 获取
+//       ...
+
+// 为什么用 false？
+//   - 此时还没有 tile，需要获取完整的迭代空间大小
+//   - 必须从操作数本身获取形状，不管它是不是切片
+//   - 这是生成 scf.for 循环边界的基础
+
+// ============================================================
+// 场景二：fromSubViewOpOnly = true
+// 用途：Fuse Producer - 确定 producer 需要计算多大
+// ============================================================
+
+// 典型调用点（在 Fuse 实现中）：
+for (unsigned loopDepth = 0; loopDepth < numLoops; ++loopDepth) {
+  ShapeDimension shapeDim =
+      getShapeDefiningLoopRange(consumerOp, loopDepth,
+                                /*fromSubViewOpOnly=*/true);
+}
+
+// 它回答的问题：
+//   "第 loopDepth 层循环的 range，应该从哪个切片获取？"
+
+// 示例（Tile 后的代码）：
+%tile = tensor.extract_slice %T[32, 32][32, 32][1, 1]
+%result = linalg.generic {
+  indexing_maps = [affine_map<(i, j) -> (i, j)>]
+  ins(%tile : tensor<32x32xf32>)
+  outs(%output) { ... }
+
+// 调用 getShapeDefiningLoopRange(consumerOp, 0, true)
+// 遍历操作数：
+//   - %tile.getDefiningOp() = tensor::ExtractSliceOp
+//   - 返回：{shape: %tile, dimension: 0}
+//   - 解释：第 0 层循环的范围从 %tile 获取
+//           %tile 的范围是 [32, 64)，size = 32
 ```
-
----
 
 #### 函数 2: getTiledOperands
 
-**问题**：获取切分Tile块需要用到的所有操作数。
+**作用**：获取切分Tile块需要用到的所有操作数。
 
 ```cpp
 static SmallVector<Value> getTiledOperands(LinalgOp producer) {
@@ -323,14 +387,14 @@ static SmallVector<Value> getTiledOperands(LinalgOp producer) {
 
 #### 函数 3: fuse（主融合函数）
 
-**问题**：给定一个 producer op 和要融合的循环范围，创建一个只计算指定范围的"克隆版本"。
+**作用**：给定一个 producer op 和要融合的循环范围，创建一个只计算指定范围的**"Tile-based Op"**。
 
 ```cpp
 static LinalgOp fuse(OpBuilder &b, LinalgOp producer,
                      const DenseMap<unsigned, Range> &fusedLoopsAndRanges)
 ```
 
-**代码逐行解析**：
+**代码解读**：
 
 ```cpp
 // ========== 输入 ==========
@@ -451,95 +515,95 @@ LinalgOp clonedOp = clone(b, producer, resultTypes, clonedShapes);
 //     linalg.yield %r
 // }
 // 现在 %1_tile 只计算 32x32 的块！
-
-// ========== 步骤 5: 调整索引偏移 ==========
-// offsetIndices 的具体作用：调整操作内部的 linalg.index 操作
-//
-// 什么是 linalg.index？
-//   在 linalg.generic 等操作内部，可以使用 linalg.index op 获取当前循环索引
-//   例如：%i = linalg.index 0  // 获取第 0 维的循环索引
-//
-// 举例说明问题：
-//   ========== 原始操作（计算整个 128x128）==========
-//   %1 = linalg.generic {
-//     indexing_maps = [affine_map<(i, j) -> (i, j)>,
-//                      affine_map<(i, j) -> (i, j)>]
-//     ins(%A : tensor<128x128xf32>)
-//     outs(%init : tensor<128x128xf32>) {
-//     ^bb0(%a: f32, %out: f32):
-//       %i = linalg.index 0  // 获取第 0 维索引，范围 [0, 128)
-//       %j = linalg.index 1  // 获取第 1 维索引，范围 [0, 128)
-//       // 假设有条件逻辑：只在 i > 64 时才计算
-//       %cond = arith.cmpi sgt, %i, %c64 : index
-//       %r = arith.select %cond, %a, %cst : f32
-//       linalg.yield %r
-//   }
-//
-//   ========== 融合后的问题（只计算 [32:64][32:64]）==========
-//   %1_tile = linalg.generic {
-//     ins(%A_tile : tensor<32x32xf32>)
-//     outs(%init_tile : tensor<32x32xf32>) {
-//     ^bb0(%a: f32, %out: f32):
-//       %i = linalg.index 0  // 问题：这里返回什么？
-//       %j = linalg.index 1  // 问题：这里返回什么？
-//       // 如果不调整，%i 仍然返回 [0, 32)，范围不对！
-//       // 原来的条件 "i > 64" 永远不会满足，逻辑就错了
-//       ...
-//   }
-//
-//   ========== offsetIndices 的修复 ==========
-//   offsetIndices 会做以下转换：
-//     %i = linalg.index 0
-//   -->
-//     %i_offset = arith.addi %i, %c32 : index
-//     // 然后把所有使用 %i 的地方替换为 %i_offset
-//
-//   修复后：
-//     ^bb0(%a: f32, %out: f32):
-//       %i_local = linalg.index 0        // 返回 [0, 32)，局部索引
-//       %i = arith.addi %i_local, %c32   // 返回 [32, 64)，全局索引
-//       %j_local = linalg.index 1
-//       %j = arith.addi %j_local, %c32
-//       // 现在条件 "i > 64" 可以正确判断了
-//       %cond = arith.cmpi sgt, %i, %c64 : index
-//       ...
-//
-//   ========== 源码分析 ==========
-//   for (IndexOp indexOp : linalgOp.getBlock()->getOps<IndexOp>()) {
-//     // 找到每个 linalg.index op
-//     // 例如：%i = linalg.index 0
-//
-//     OpFoldResult applied = makeComposedFoldedAffineApply(
-//         b, indexOp.getLoc(), index + offset,
-//         {indexOp.getResult(), offsets[indexOp.getDim()]});
-//     // 创建 affine_apply: %i + %c32
-//
-//     b.replaceUsesWithIf(indexOp, materialized, ...);
-//     // 把所有使用 %i 的地方替换为 (%i + 32)
-//   }
-
 SmallVector<OpFoldResult> allIvs = llvm::to_vector(
     llvm::map_range(loopRanges, [&](Range range) {
       return range.offset;  // 提取每个范围的偏移
     }));
 // allIvs = [32, 32]
 offsetIndices(b, clonedOp, allIvs);
+// ========== 步骤 5: 调整索引偏移 ==========
+// offsetIndices 的具体作用：调整操作内部的 linalg.index 操作，具体见下方的注解。
 
 return clonedOp;  // 返回融合后的操作 %1_tile
+```
+
+**注解：offsetIndices函数的作用**
+
+```cpp
+// 什么是 linalg.index？
+// 在 linalg.generic 等操作内部，可以使用 linalg.index op 获取当前循环索引
+// 例如：%i = linalg.index 0  // 获取第 0 维的循环索引
+
+// 举例说明问题：
+// ========== 原始操作（计算整个 128x128）==========
+%1 = linalg.generic {
+ indexing_maps = [affine_map<(i, j) -> (i, j)>,
+                  affine_map<(i, j) -> (i, j)>]
+ ins(%A : tensor<128x128xf32>)
+ outs(%init : tensor<128x128xf32>) {
+ ^bb0(%a: f32, %out: f32):
+   %i = linalg.index 0  // 获取第 0 维索引，范围 [0, 128)
+   %j = linalg.index 1  // 获取第 1 维索引，范围 [0, 128)
+   // 假设有条件逻辑：只在 i > 64 时才计算
+   %cond = arith.cmpi sgt, %i, %c64 : index
+   %r = arith.select %cond, %a, %cst : f32
+   linalg.yield %r
+}
+
+//  ========== 融合后的问题（只计算 [32:64][32:64]）==========
+%1_tile = linalg.generic {
+ ins(%A_tile : tensor<32x32xf32>)
+ outs(%init_tile : tensor<32x32xf32>) {
+ ^bb0(%a: f32, %out: f32):
+   %i = linalg.index 0
+   %j = linalg.index 1
+   // 如果不调整，%i 仍然返回 [0, 32)，范围不对！
+   // 原来的条件 "i > 64" 永远不会满足，逻辑就错了
+   ...
+}
+
+//  ========== offsetIndices 的修复 ==========
+// offsetIndices 会做以下转换：
+ %i = linalg.index 0    --> %i_offset = arith.addi %i, %c32 : index
+ // 然后把所有使用 %i 的地方替换为 %i_offset
+
+// 修复后：
+ ^bb0(%a: f32, %out: f32):
+   %i_local = linalg.index 0        // 返回 [0, 32)，局部索引
+   %i = arith.addi %i_local, %c32   // 返回 [32, 64)，全局索引
+   %j_local = linalg.index 1
+   %j = arith.addi %j_local, %c32
+   // 现在条件 "i > 64" 可以正确判断了
+   %cond = arith.cmpi sgt, %i, %c64 : index
+   ...
+
+// ========== 源码分析 ==========
+for (IndexOp indexOp : linalgOp.getBlock()->getOps<IndexOp>()) {
+ // 找到每个 linalg.index op
+ // 例如：%i = linalg.index 0
+
+ OpFoldResult applied = makeComposedFoldedAffineApply(
+     b, indexOp.getLoc(), index + offset,
+     {indexOp.getResult(), offsets[indexOp.getDim()]});
+ // 创建 affine_apply: %i + %c32
+
+ b.replaceUsesWithIf(indexOp, materialized, ...);
+ // 把所有使用 %i 的地方替换为 (%i + 32)
+}
 ```
 
 ---
 
 #### 函数 4: getRangeFromOperandShape
 
-**问题**：从切片操作数中提取范围信息。
+**作用**：从切片操作数中提取范围信息。
 
 ```cpp
 static Range getRangeFromOperandShape(OpBuilder &b, Location loc,
                                       Value shapedOperand, unsigned dim)
 ```
 
-**代码逐行解析**：
+**代码解读**：
 
 ```cpp
 // ========== 输入 ==========
@@ -548,7 +612,7 @@ static Range getRangeFromOperandShape(OpBuilder &b, Location loc,
   // 从 %A[32:64][16:48] 提取 32x32 的块
 
 // 调用：getRangeFromOperandShape(b, loc, %slice, 0)
-// 意思：获取第 0 维的范围
+// 作用：获取第 0 维的范围
 
 // ========== 执行过程 ==========
 // 获取定义这个操作数的操作
@@ -557,7 +621,7 @@ Operation *shapeProducingOp = shapedOperand.getDefiningOp();
 
 // 根据操作类型提取范围
 if (auto subViewOp = dyn_cast<memref::SubViewOp>(shapeProducingOp))
-  // Buffer 语义：从 SubViewOp 获取范围
+  // Buffer 语义：从 SubViewOp 获取范围，代码与 ExtractSliceOp 类似。
   return subViewOp.getOrCreateRanges(b, loc)[dim];
 
 if (auto sliceOp = dyn_cast<tensor::ExtractSliceOp>(shapeProducingOp))
@@ -565,7 +629,7 @@ if (auto sliceOp = dyn_cast<tensor::ExtractSliceOp>(shapeProducingOp))
   // dim = 0，获取第 0 维的范围
   return sliceOp.getOrCreateRanges(b, loc)[dim];
   // getOrCreateRanges() 返回 [{offset: 32, size: 32, stride: 1},
-  //                             {offset: 16, size: 32, stride: 1}]
+  //                           {offset: 16, size: 32, stride: 1}]
   // 返回：Range { offset: 32, size: 32, stride: 1 }
   // 解释：从偏移 32 开始，大小 32，步长 1
 
@@ -580,14 +644,14 @@ llvm_unreachable("必须是 SubViewOp 或 ExtractSliceOp");
 
 #### 函数 5: fuse（重载版本）
 
-**问题**：这是更高级的 fuse 函数，自动从消费者操作数推断融合范围。
+**作用**：这是更高级的 fuse 函数，自动从 Consumer 操作数推断融合范围。
 
 ```cpp
 static LinalgOp fuse(OpBuilder &b, LinalgOp producerOp,
                      AffineMap producerMap, OpOperand &consumerOpOperand)
 ```
 
-**代码逐行解析**：
+**代码解读**：
 
 ```cpp
 // ========== 输入 ==========
@@ -602,7 +666,7 @@ producerMap = affine_map<(i, j) -> (i, j)>
 DenseMap<unsigned, Range> fusedLoopsAndRanges;
 Value shapedOperand = consumerOpOperand.get();  // shapedOperand = %slice
 
-// 遍历生产者索引映射的每个结果
+// 遍历生产者 IndexMap(affine_map右侧) 的每个结果
 // producerMap.getResults() = [i, j]
 for (const auto &en : llvm::enumerate(producerMap.getResults())) {
   // en.index() 是结果索引（0, 1, ...）
@@ -645,36 +709,31 @@ return fuse(b, producerOp, fusedLoopsAndRanges);
 
 #### 函数 6: getProducerOfTensor
 
-**问题**：沿着 use-def 链向上追溯，找到真正产生这个张量的操作。
+**作用**：沿着 use-def 链向上追溯，找到某个 Tensor 的 Producer Op。
 
 ```cpp
 static void getProducerOfTensor(Value tensor, OpResult &opResult)
 ```
 
-**代码逐行解析**：
+**代码解读**：
 
 ```cpp
-// ========== 场景 1: 直接生产者 ==========
-// %1 = linalg.generic ins(%A) outs(%init) { ... }
-// getProducerOfTensor(%1)
-
 while (true) {
-  // 情况 1: 直接由 LinalgOp 定义
+  // ========== 场景 1: Producer 是 LinalgOp   ==========
+  // %1 = linalg.generic ins(%A) outs(%init) { ... }
+  // getProducerOfTensor(%1)
   if (auto linalgOp = tensor.getDefiningOp<LinalgOp>()) {
-    // 找到了！这个操作就是生产者
-    // tensor = %1，由 linalg.generic 定义
+    // tensor = %1，即由 linalg.generic 生成
     opResult = cast<OpResult>(tensor);  // 转换为 OpResult
-    // opResult = linalg.generic 的第 0 个结果
+    // opResult = linalg.generic 的输出（就1个输出）
     return;
   }
-  // 返回：linalg.generic 操作的第 0 个结果
 
-  // ========== 场景 2: 通过切片链接 ==========
+  // ========== 场景 2: Producer 是 ExtractSliceOp  ==========
   // %1 = linalg.generic ins(%A) outs(%init) { ... }
   // %slice = tensor.extract_slice %1[10, 10][32, 32][1, 1]
   // getProducerOfTensor(%slice)
 
-  // 情况 2: 通过 ExtractSliceOp 链接
   if (auto sliceOp = tensor.getDefiningOp<tensor::ExtractSliceOp>()) {
     // 第一次循环：tensor = %slice，由 ExtractSliceOp 定义
     // 获取切片的源，继续追溯
@@ -683,10 +742,10 @@ while (true) {
     continue;  // 继续循环
 
     // 第二次循环：tensor = %1，由 linalg.generic 定义
-    // 进入情况 1，返回 linalg.generic 的第 0 个结果
+    // 进入场景 1，返回 linalg.generic 的输出
   }
 
-  // ========== 场景 3: 通过循环迭代参数 ==========
+  // ========== 场景 3: Producer 是 ForOp ==========
   // %1 = linalg.generic ins(%A) outs(%init) { ... }
   // %2 = scf.for %i = 0 to 10 iter_args(%arg = %1) {
   //   %3 = linalg.generic ins(%arg) outs(%init2) { ... }
@@ -694,7 +753,6 @@ while (true) {
   // }
   // getProducerOfTensor(%arg)
 
-  // 情况 3: 通过 scf::For 迭代参数
   if (auto blockArg = dyn_cast<BlockArgument>(tensor)) {
     // 第一次循环：tensor = %arg，是 BlockArgument
     if (auto forOp = blockArg.getDefiningOp<scf::ForOp>()) {
@@ -707,7 +765,7 @@ while (true) {
       continue;  // 继续循环
 
       // 第二次循环：tensor = %1，由 linalg.generic 定义
-      // 进入情况 1，返回 linalg.generic 的第 0 个结果
+      // 进入情况 1，返回 linalg.generic 的输出
     }
   }
 
@@ -720,18 +778,18 @@ while (true) {
 
 #### 函数 7: fuseProducerOfTensor（公共 API）
 
-**问题**：这是主要的融合入口点，整合所有步骤。
+**作用**：这是主要的融合入口点，整合所有步骤。
 
 ```cpp
 FailureOr<FusionInfo> mlir::linalg::fuseProducerOfTensor(
     OpBuilder &b, OpOperand &consumerOpOperand)
 ```
 
-**代码逐行解析**：
+**代码解读**：
 
 ```cpp
 // ========== 输入：融合前 ==========
-// consumerOpOperand 是消费者操作的第 0 个输入（%1_tile）
+// consumerOpOperand 是 Consumer Op 的第 0 个输入（%1_tile）
 func.func @example(%A: tensor<128x128xf32>,
                    %C: tensor<128x128xf32>) {
   // 生产者：计算整个 128x128
@@ -750,7 +808,7 @@ func.func @example(%A: tensor<128x128xf32>,
   }
 }
 
-// ========== 步骤 1: 查找生产者 ==========
+// ========== 步骤 1: 查找 Producer ==========
 Value inputTensor = consumerOpOperand.get();
 // inputTensor = %1_tile
 OpResult producerOpResult;
@@ -758,7 +816,7 @@ getProducerOfTensor(inputTensor, producerOpResult);
 // 沿着 use-def 链追溯：
 //   %1_tile 由 ExtractSliceOp 定义，获取源 %1
 //   %1 由 linalg.generic 定义，找到了！
-// producerOpResult = %1 (linalg.generic 的第 0 个结果)
+// producerOpResult = %1 (linalg.generic 的输出)
 
 if (!producerOpResult) {
   return failure();  // 找不到生产者，无法融合
@@ -767,11 +825,11 @@ if (!producerOpResult) {
 // ========== 步骤 2: 验证操作类型 ==========
 auto producerOp = dyn_cast<LinalgOp>(producerOpResult.getOwner());
 // producerOp = %1 的定义操作（linalg.generic）
-if (!producerOp) return failure();  // 生产者不是 LinalgOp
+if (!producerOp) return failure();  // 生产者不是 LinalgOp 则失败
 
 LinalgOp consumerOp = dyn_cast<LinalgOp>(consumerOpOperand.getOwner());
 // consumerOp = 消费者操作（linalg.generic）
-if (!consumerOp) return failure();  // 消费者不是 LinalgOp
+if (!consumerOp) return failure();  // 消费者不是 LinalgOp 则失败
 
 // ========== 步骤 3: 验证必须是 ExtractSliceOp ==========
 auto sliceOp = inputTensor.getDefiningOp<tensor::ExtractSliceOp>();
@@ -854,31 +912,9 @@ func.func @example(%A: tensor<128x128xf32>,
     }
   }
 }
-
-// 好处：
-// 1. 消除了中间张量 %1 的 128x128 计算
-// 2. 只计算循环内实际需要的 32x32 块
-// 3. 减少内存访问，提高缓存利用率
 ```
 
 ---
-
-## Fusion 与 Tiling 的配合
-
-### TileAndFuse 工作流
-
-```
-1. Tiling 消费者操作
-   └─> 生成 extract_slice 操作
-
-2. 查找 extract_slice 的生产者
-   └─> 通过 getProducerOfTensor
-
-3. 融合生产者到消费者循环内
-   └─> 使用 fuseProducerOfTensor
-
-4. 重复直到没有更多可融合的操作
-```
 
 ### 完整示例
 
@@ -976,6 +1012,204 @@ func.func @example(%A: tensor<128x128xf32>,
   scf.yield %result2
 }
 ```
+
+---
+
+## Greedy Fusion 完整调用逻辑
+
+源码位置: `mlir/test/lib/Dialect/Linalg/TestLinalgFusionTransforms.cpp`
+
+### 核心函数: fuseLinalgOpsGreedily
+
+```cpp
+static LogicalResult fuseLinalgOpsGreedily(func::FuncOp f) {
+  OpBuilder b(f);
+
+  // 步骤 1: 收集所有 Linalg 操作
+  SmallVector<LinalgOp, 8> linalgOps;
+  f.walk([&](LinalgOp op) {
+    // 只支持单结果操作
+    if (op->getNumResults() <= 1)
+      linalgOps.push_back(op);
+  });
+
+  // 步骤 2: 反向遍历，从消费者到生产者
+  bool changed = false;
+  for (LinalgOp linalgOp : llvm::reverse(linalgOps)) {
+    // 遍历当前操作的所有操作数
+    for (OpOperand &opOperand : linalgOp->getOpOperands()) {
+      // 跳过 MemRef 类型（Buffer 语义）
+      if (isa<MemRefType>(opOperand.get().getType()))
+        continue;
+
+      // 只处理 Tensor 类型的输入
+      if (isa<RankedTensorType>(opOperand.get().getType())) {
+        // 跳过输出操作数（DpsInit），只融合输入
+        if (opOperand.getOperandNumber() >= linalgOp.getNumDpsInputs())
+          continue;
+
+        // 调用核心融合函数
+        auto info = fuseProducerOfTensor(b, opOperand);
+        if (failed(info))
+          continue;
+
+        // 更新操作列表：用融合后的操作替换原操作
+        auto *originalOp = info->originalProducer.getOperation();
+        auto *originalOpInLinalgOpsVector = llvm::find(linalgOps, originalOp);
+        *originalOpInLinalgOpsVector = info->fusedProducer;
+
+        // 不删除原操作，让 DCE (Dead Code Elimination) 处理
+        changed = true;
+      }
+    }
+  }
+
+  return changed ? success() : failure();
+}
+```
+
+### 执行流程
+
+```
+1. 收集阶段
+   ┌─────────────────────────────────────┐
+   │ %1 = linalg.generic { ... }         │  → linalgOps[0]
+   │ %2 = linalg.matmul ins(%1, %B)      │  → linalgOps[1]
+   │ %3 = linalg.generic ins(%2) outs(%C)│  → linalgOps[2]
+   └─────────────────────────────────────┘
+
+2. 反向遍历
+   reverse(linalgOps) = [%3, %2, %1]
+
+   第一轮: linalgOp = %3 (消费者)
+     └─> 操作数 %2 是 Tensor
+         └─> fuseProducerOfTensor(%2)
+             └─> 找到生产者 %2 (matmul)
+                 └─> 融合: %2_fused = linalg.matmul ins(%1_fused, %B_tile)
+
+   第二轮: linalgOp = %2 (原 matmul，已被替换为 %2_fused)
+     └─> 操作数 %1 是 Tensor
+         └─> fuseProducerOfTensor(%1)
+             └─> 找到生产者 %1 (generic)
+                 └─> 融合: %1_fused = linalg.generic ins(%A_tile)
+
+3. 结果: 所有操作融合到最内层循环
+```
+
+### Pass 集成: TestLinalgGreedyFusion
+
+```cpp
+struct TestLinalgGreedyFusion : public PassWrapper<...> {
+  void runOnOperation() override {
+    MLIRContext *context = &getContext();
+
+    // 准备规范化模式
+    RewritePatternSet patterns =
+        linalg::getLinalgTilingCanonicalizationPatterns(context);
+    patterns.add<ExtractSliceOfPadTensorSwapPattern>(context);
+    scf::populateSCFForLoopCanonicalizationPatterns(patterns);
+    FrozenRewritePatternSet frozenPatterns(std::move(patterns));
+
+    // 准备 Pass Pipeline
+    OpPassManager pm(func::FuncOp::getOperationName());
+    pm.addPass(createLoopInvariantCodeMotionPass());  // 循环不变量外提
+    pm.addPass(createCanonicalizerPass());            // 规范化
+    pm.addPass(createCSEPass());                      // 公共子表达式消除
+
+    // 迭代融合直到无法继续
+    do {
+      // 应用规范化模式
+      (void)applyPatternsGreedily(getOperation(), frozenPatterns);
+
+      // 运行优化 Pass
+      if (failed(runPipeline(pm, getOperation())))
+        this->signalPassFailure();
+
+      // 尝试融合，返回 success 表示还有可融合的操作
+    } while (succeeded(fuseLinalgOpsGreedily(getOperation())));
+  }
+};
+```
+
+### 迭代过程示例
+
+```mlir
+// ========== 初始状态 ==========
+func.func @example(%A: tensor<128x128xf32>,
+                   %B: tensor<128x128xf32>,
+                   %C: tensor<128x128xf32>) {
+  %1 = linalg.generic ins(%A) outs(%init) { add }
+  %2 = linalg.matmul ins(%1, %B) outs(%init2)
+  %3 = linalg.generic ins(%2) outs(%C) { mul }
+  return %3
+}
+
+// ========== 迭代 1: fuseLinalgOpsGreedily ==========
+// 反向遍历: %3 -> %2 -> %1
+
+// 处理 %3: 操作数 %2 是 Tensor，尝试融合
+// 但 %2 没有 extract_slice（因为还没 tile），融合失败
+
+// ========== 先运行 Tiling Pass（手动添加）==========
+// Tile 后:
+%3 = scf.for %ii = 0 to 128 step 32 {
+  %result = scf.for %jj = 0 to 128 step 32 {
+    %2_tile = tensor.extract_slice %2[%ii, %jj][32, 32][1, 1]
+    %3_tile = linalg.generic ins(%2_tile) outs(%C_tile) { mul }
+    tensor.insert_slice %3_tile into %result[%ii, %jj][32, 32]
+  }
+}
+
+// ========== 迭代 2: fuseLinalgOpsGreedily（Tile 后）==========
+// 处理 %3: 操作数 %2_tile 由 extract_slice 定义
+// └─> fuseProducerOfTensor 成功！
+//     融合 %2 (matmul) 到循环内
+
+%3 = scf.for %ii = 0 to 128 step 32 {
+  %result = scf.for %jj = 0 to 128 step 32 {
+    // 融合的 matmul
+    %1_tile = tensor.extract_slice %1[%ii, 0][32, 128][1, 1]
+    %B_tile = tensor.extract_slice %B[0, %jj][128, 32][1, 1]
+    %2_tile = linalg.matmul ins(%1_tile, %B_tile) outs(%output_tile)
+
+    %3_tile = linalg.generic ins(%2_tile) outs(%C_tile) { mul }
+    tensor.insert_slice %3_tile into %result[%ii, %jj][32, 32]
+  }
+}
+
+// ========== 迭代 3: fuseLinalgOpsGreedily ==========
+// 处理融合后的 %2: 操作数 %1_tile 由 extract_slice 定义
+// └─> fuseProducerOfTensor 再次成功！
+//     融合 %1 (generic add) 到循环内
+
+%3 = scf.for %ii = 0 to 128 step 32 {
+  %result = scf.for %jj = 0 to 128 step 32 {
+    // 融合的 add
+    %A_tile = tensor.extract_slice %A[%ii, 0][32, 128][1, 1]
+    %1_tile = linalg.generic ins(%A_tile) outs(%init_tile) { add }
+
+    // 融合的 matmul
+    %B_tile = tensor.extract_slice %B[0, %jj][128, 32][1, 1]
+    %2_tile = linalg.matmul ins(%1_tile, %B_tile) outs(%output_tile)
+
+    %3_tile = linalg.generic ins(%2_tile) outs(%C_tile) { mul }
+    tensor.insert_slice %3_tile into %result[%ii, %jj][32, 32]
+  }
+}
+
+// ========== 迭代 4: fuseLinalgOpsGreedily ==========
+// 处理融合后的 %1: 操作数 %A_tile 由 extract_slice 定义
+// └─> %A 是函数参数，没有生产者，融合失败
+//     返回 failure，循环结束
+```
+
+### 关键设计点
+
+1. **反向遍历**: 从消费者向生产者融合，保证融合顺序正确
+2. **更新操作列表**: 融合后替换原操作，避免重复融合
+3. **不立即删除**: 保留原操作让 DCE 处理，避免 use-def 链断裂
+4. **迭代执行**: 与规范化 Pass 配合，持续融合直到稳定
+5. **只融合输入**: 跳过 `DpsInit`（输出操作数），避免复杂依赖
 
 ---
 

@@ -1,18 +1,5 @@
 # MLIR Linalg 方言 Tiling 机制全面分析
 
-## 目录
-
-1. [概述](#概述)
-2. [核心概念](#核心概念)
-3. [Tiling.cpp 核心函数详解](#tilingcpp-核心函数详解)
-4. [Tiling 相关 Transforms](#tiling-相关-transforms)
-5. [TilingInterface 接口](#tilinginterface-接口)
-6. [高级 Tiling 技术](#高级-tiling-技术)
-7. [实践示例](#实践示例)
-8. [总结](#总结)
-
----
-
 ## 概述
 
 **Tiling（平铺/分块）** 是一种重要的循环优化技术，通过将大的迭代空间分割成较小的块（tiles）来提高数据局部性、启用并行化，并为融合创造机会。
