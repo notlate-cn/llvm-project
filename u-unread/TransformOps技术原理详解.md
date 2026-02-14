@@ -2186,10 +2186,10 @@ processed_data = batch_iterate(
   - [x] 包含详细的 WHY 注释
   - [x] 说明了执行结果
 
-- [x] 问题与改进建议
-  - [x] 指出潜在问题
-  - [x] WHY 是问题
-  - [x] 设计权衡说明
+- [ ] 问题与改进建议
+  - [ ] 指出潜在问题
+  - [ ] WHY 是问题
+  - [ ] 设计权衡说明
 
 ---
 
@@ -2225,10 +2225,3 @@ TransformOps.cpp 实现了 MLIR Transform Dialect 的核心操作，遵循以下
 - [MLIR Transform Dialect 文档](https://mlir.llvm.org/docs/Dialects/Transform/)
 - [MLIR 编写转换指南](https://mlir.llvm.org/docs/Transformations/)
 - [Transform Dialect C++ API](https://github.com/llvm/llvm-project/tree/main/mlir/include/mlir/Dialect/Transform)
-
----
-
-**文档版本：** 2.0 (Deep Mode 完整版)
-**最后更新：** 2026-01-31
-**作者：** 基于 TransformOps.cpp 源码分析
-**分析模式：** Deep Mode（包含应用迁移场景）
