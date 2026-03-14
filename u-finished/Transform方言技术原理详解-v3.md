@@ -1,26 +1,67 @@
-# MLIR Transform 方言技术原理详解 v3.0
+# 【MLIR】Transform 方言深入研究
 
-> 基于 MLIR 官方文档 [Transform Dialect - Overview](https://mlir.llvm.org/docs/Dialects/Transform/#overview) 和源代码 `mlir/lib/Dialect/Transform/`、`mlir/lib/Dialect/Linalg/TransformOps/` 深度分析生成。
-
-## 目录
-
-0. [快速入门](#0-快速入门)
-1. [快速概览](#1-快速概览)
-2. [背景与动机](#2-背景与动机)
-3. [核心概念](#3-核心概念)
-4. [类型系统](#4-类型系统)
-5. [核心操作详解](#5-核心操作详解)
-6. [源码实现：TransformState](#6-源码实现transformstate)
-7. [源码实现：TransformDialectExtension](#7-源码实现transformdialectextension)
-8. [执行模型](#8-执行模型)
-9. [扩展开发完整教程](#9-扩展开发完整教程)
-10. [实战案例](#10-实战案例)
-11. [调试与排错](#11-调试与排错)
-12. [性能与最佳实践](#12-性能与最佳实践)
-13. [常见问题FAQ](#13-常见问题faq)
-14. [参考资料](#14-参考资料)
+> 本文档基于[Claude Code + GLM4.7&Sonnet4.6](https://www.cnblogs.com/notlate-cn/p/19452715) + [CodeReaderSkills](https://www.cnblogs.com/notlate-cn/p/19560365)完成。
 
 ---
+
+## 方言完整地图
+
+### 目录结构
+
+```
+mlir/
+├── include/mlir/Dialect/Transform/
+│   ├── IR/
+│   │   ├── TransformDialect.h/td       # 方言注册、扩展机制
+│   │   ├── TransformOps.h/td           # 核心操作定义（sequence/foreach等）
+│   │   ├── TransformTypes.h/td         # Handle类型（AnyOp/Operation/Param等）
+│   │   ├── TransformAttrs.h/td         # 属性（FailurePropagationMode等）
+│   │   └── Utils.h                     # IR工具
+│   ├── Interfaces/
+│   │   ├── TransformInterfaces.h/td    # 核心接口（TransformOpInterface等）
+│   │   └── MatchInterfaces.h/td        # 匹配接口
+│   ├── Transforms/
+│   │   ├── Passes.h/td                 # Pass声明
+│   │   └── TransformInterpreterUtils.h # 解释器工具
+│   ├── Utils/
+│   │   ├── DiagnosedSilenceableFailure.h  # 三态错误类型
+│   │   ├── RaggedArray.h               # 不规则二维数组
+│   │   └── Utils.h
+│   ├── DebugExtension/                 # 调试扩展（emit_remark等）
+│   ├── LoopExtension/                  # 循环变换扩展
+│   ├── PDLExtension/                   # PDL模式匹配扩展
+│   ├── TuneExtension/                  # 可调参数扩展
+│   └── IRDLExtension/                  # IRDL扩展
+│
+├── lib/Dialect/Transform/
+│   ├── IR/                             # 核心IR实现
+│   ├── Interfaces/                     # 接口实现
+│   ├── Transforms/                     # Pass实现
+│   ├── Utils/                          # 工具实现
+│   └── [DebugExtension/.../TuneExtension/]  # 各扩展实现
+│
+└── test/Dialect/Transform/
+    ├── ops.mlir                        # 基础操作测试
+    ├── ops-invalid.mlir                # 48个非法用法案例
+    ├── interpreter.mlir                # 解释器执行测试
+    ├── foreach-match.mlir              # 模式匹配迭代测试
+    ├── selective-targeting.mlir        # 选择性目标测试
+    ├── check-use-after-free.mlir       # Handle生命周期安全测试
+    ├── test-interpreter.mlir           # 完整解释器测试（70KB+）
+    ├── apply-foreach-nested.mlir       # 嵌套foreach测试
+    ├── infer-effects.mlir              # 自动推断副作用测试
+    └── include/                        # 外部库测试素材
+```
+
+### 文件规模概览
+
+| 文件                                        | 行数 | 职责                                      |
+| ------------------------------------------- | ---- | ----------------------------------------- |
+| `lib/Interfaces/TransformInterfaces.cpp`    | 2045 | 执行引擎核心（TransformState、apply流程） |
+| `lib/IR/TransformOps.cpp`                   | 3138 | 所有内置Transform操作实现                 |
+| `include/Interfaces/TransformInterfaces.h`  | 1624 | TransformState、接口声明                  |
+| `include/IR/TransformOps.td`                | 1398 | 操作定义（TableGen）                      |
+| `include/Interfaces/TransformInterfaces.td` | 413  | 接口定义（TableGen）                      |
 
 ## 0. 快速入门
 
@@ -180,28 +221,17 @@ transform.sequence failures(propagate) {
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.3 WHY 需要 Transform 方言？
-
-**问题本质：** 传统编译器优化 Pass 缺乏精细控制能力
-
-- **Pass 粒度太粗**：Pass 对所有匹配的 IR 操作应用相同的转换
-- **Pass 组合困难**：需要特定顺序的转换时，Pass 组合会爆炸式增长
-- **缺乏选择能力**：无法根据运行时信息选择不同的转换策略
-
-**WHY 选择 Transform 方言：**
-
-- **精细控制**：可以针对单个或一组操作应用特定转换
-- **可编程组合**：使用 IR 本身表达转换序列，灵活组合
-- **类型安全**：通过 Handle 类型系统确保转换前置条件
-- **可扩展**：通过扩展机制添加方言特定的转换操作
-
 ---
 
 ## 2. 背景与动机
 
-### 2.1 问题场景
+### 2.1 问题本质
 
-考虑以下编译优化场景：
+**要解决的问题：**传统的MLIR Pass无法精细控制"对哪些操作应用哪种变换"。官方文档对此的描述是：
+
+> The main use case is orchestrating fine-grain transformations on individual IR objects — finding loop-like operations with specific properties (e.g., large size) and applying loop tiling to **those and only those operations**.
+
+**考虑以下编译优化场景：**
 
 ```mlir
 // 假设有以下循环嵌套需要优化
@@ -214,13 +244,34 @@ scf.for %i = 0 to 1024 {
 }
 ```
 
-**传统 Pass 方法的局限：**
+传统Pass是"全局扫描、统一应用"的模型。例如 `--linalg-tile` 会对所有 `linalg.*` 操作进行平铺，参数全局统一。这造成：
 
-1. **无法区分**：Pass 对所有循环应用相同转换
+1. **无法区分**：Pass 对所有 循环Op 应用相同转换
 2. **无法组合**：想要"先切分最内层循环，再切分次内层"需要编写新 Pass
 3. **无法回退**：某种转换失败时，无法尝试备选方案
+4. **调试困难**：哪些操作被变换了，哪些没有，完全不透明
 
-### 2.2 Transform 方言的解决方案
+### 2.2 方案选择
+
+**WHY 选择嵌入式DSL（Transform IR）而不是Python脚本？**
+
+| 方案                   | 优势                                   | 劣势                                   |
+| ---------------------- | -------------------------------------- | -------------------------------------- |
+| Transform IR（现方案） | 类型安全、可验证、与MLIR编译器同步运行 | 需要学习新语法                         |
+| Python脚本             | 灵活、生态丰富                         | 与IR的类型系统脱节，运行时错误难以定位 |
+| 配置文件（如YAML）     | 简单                                   | 表达能力有限，无法动态决策             |
+
+Transform方言的设计选择是：**让Transform本身也是MLIR IR**，这带来了最大的好处：
+
+- Transform IR可以被分析、验证、优化
+- Transform IR可以被其他程序生成
+- Transform IR可以作为库函数被重用（named_sequence）
+
+**WHY 不用JIT/动态执行？**
+
+Transform IR是**声明式的、可静态分析的**。这允许在执行前验证handle消费约束、副作用声明等，而不是等到运行时才报错。
+
+### 2.3 Transform 方言的解决方案
 
 ```mlir
 // 使用 Transform 方言精细控制转换
@@ -239,41 +290,114 @@ transform.sequence failures(propagate) {
 }
 ```
 
+### 2.4 应用场景
+
+**适用场景：**
+
+- 编译pipeline中需要精细控制的阶段（ML编译器、HPC优化）
+- 算子库开发（需要对特定尺寸的矩阵乘法使用特定变换策略）
+- 自动调优（通过TuneExtension探索变换参数空间）
+
+**不适用场景：**
+
+- 全局统一的简单变换（用普通Pass更简单）
+- 不需要跨操作协调的变换（单独的Pattern更合适）
+
 ---
 
 ## 3. 核心概念
 
-### 3.1 Payload IR 与 Transform IR
+### 3.1 概念清单
 
-**概念：** Transform 方言引入了两个 IR 层级的分离
+**概念 1：Payload IR vs Transform IR**
 
-| IR 类型 | 作用 | 示例 |
-|---------|------|------|
-| **Payload IR** | 被转换的目标 IR | `linalg.matmul`, `scf.for`, `arith.addf` |
-| **Transform IR** | 控制转换逻辑的 IR | `transform.sequence`, `transform.loop.tile` |
+- **是什么：** 两个独立的IR世界。Payload IR是"被变换的代码"（用户的程序），Transform IR是"描述如何变换的规则"（变换脚本）。
+- **WHY 需要：** 将"做什么"与"怎么做"分离。没有这种分离，变换逻辑会硬编码到每个Pass中，无法重用和组合。
+- **WHY 这样实现：** Transform IR与Payload IR共存于同一个MLIRContext但在不同的Operation树中，由TransformState维护它们之间的映射关系。
 
-**WHY 这样分离：**
+**概念 2：Handle（句柄）**
 
-- **关注点分离**：转换逻辑与业务逻辑解耦
-- **可重用性**：同一转换脚本可应用于不同的 Payload IR
-- **类型安全**：Transform IR 的类型系统可以验证转换的正确性
+- **是什么：** Transform IR中的一个值（`%handle : !transform.any_op`），指向Payload IR中的一组操作或值。类比于数据库中的游标，或C++中指向容器元素的迭代器。
+- **WHY 需要：** Transform op需要一种方式指定"作用在哪些Payload操作上"，handle就是这个"指针"。
+- **WHY 不用操作名字符串：** 字符串无类型安全，一个Payload程序中可能有多个同名操作，无法区分。Handle指向特定的操作实例。
 
-### 3.2 Handle（句柄）
+**概念 3：TransformState**
 
-**概念：** Handle 是 Transform IR 中指向 Payload IR 对象的引用
+- **是什么：** 执行Transform IR时的运行时状态，维护所有handle到Payload操作的映射。是整个执行引擎的中枢。
+- **WHY 需要：** Transform操作之间需要共享映射信息——前一个操作产生的handle，后一个操作才能使用。TransformState就是这个共享的黑板（blackboard）。
+- **WHY 双向映射：** 正向（handle→ops）用于查询；反向（op→handles）用于失效传播（O(1)而非O(n)）。
 
-```mlir
-// Handle 示例
-%0: !transform.any_op        // 指向任意操作的 Handle
-%1: !transform.any_value     // 指向任意值的 Handle
-%2: !transform.param<i32>     // 指向参数的 Handle
+**概念 4：DiagnosedSilenceableFailure**
+
+- **是什么：** 三态错误类型（成功/可沉默失败/确定失败），是所有Transform操作的返回值类型。
+- **WHY 需要三态：** 编译优化中"优化无法应用"不等于"程序有错误"。Silenceable failure让容器操作可以选择忽略并继续，而definite failure则表示不可恢复的错误。
+- **WHY 不用异常：** MLIR全面使用基于返回值的错误处理，避免异常带来的控制流复杂性。
+
+**概念 5：内存效应（Memory Effects）**
+
+- **是什么：** Transform操作对handle和payload的副作用声明（Allocate/Free/Read/Write）。
+- **WHY 需要：** 系统需要知道某个操作是否"消费"（销毁/修改）了handle，以便跟踪handle的有效性。没有效应声明，就无法检测use-after-free。
+- **WHY 不用自动推断：** 只有操作的实现者才知道它的副作用，自动推断会导致保守的过度标注（所有操作都视为消费）。
+
+#### 概念关系矩阵
+
+| 关系类型  | 概念 A                      | 概念 B     | WHY 这样关联                                               |
+| --------- | --------------------------- | ---------- | ---------------------------------------------------------- |
+| 包含/管理 | TransformState              | Handle映射 | TransformState是所有映射的唯一权威                         |
+| 产生/消费 | Transform操作               | Handle     | 操作通过TransformResults产生handle，通过operands消费handle |
+| 约束/检查 | 内存效应                    | Handle消费 | 效应声明决定哪些操作会失效handle                           |
+| 包装/传播 | DiagnosedSilenceableFailure | 错误诊断   | 包装Diagnostic对象，强制显式处理                           |
+| 作用于    | Transform IR                | Payload IR | Transform操作修改Payload，但两者物理分离                   |
+
+### 3.2 TransformState 类
+
+**TransformState是整个Transform方言的"执行上下文"**，维护Transform IR值与Payload IR实体之间的多对多映射。
+
+#### 内部数据结构
+
+```cpp
+// 每个Region有独立的Mappings，形成作用域栈
+struct Mappings {
+  TransformOpMapping direct;     // Value -> [Operation*]  正向映射
+  TransformOpReverseMapping reverse; // Operation* -> [Value]  反向映射
+  ParamMapping params;           // Value -> [Attribute]  参数映射
+  ValueMapping values;           // Value -> [Value]       值映射
+  ValueMapping reverseValues;    // Value -> [Value]       反向值映射
+};
+
+// 每个Region有独立的映射（隔离作用域）
+DenseMap<Region*, std::unique_ptr<Mappings>> mappings;
+std::vector<RegionScope*> regionStack;
+
+// 顶级额外映射（传给顶级op的参数）
+RaggedArray<MappedValue> topLevelMappedValues;
 ```
 
-**Handle 的关键特性：**
+**为什么双向映射？**
 
-1. **多对象关联**：一个 Handle 可以关联多个 Payload IR 对象
-2. **类型约束**：Handle 类型编码了关联对象的属性
-3. **批量执行**：大多数 Transform 操作对 Handle 关联的所有对象执行
+正向映射（handle → ops）：Transform op问"我的operand对应哪些payload ops"。
+反向映射（op → handles）：当一个op被删除时，需要快速找出所有指向它的handles并使其失效。如果只有正向映射，必须遍历所有handles（O(n)）；有了反向映射，只需查表（O(1)）。
+
+**为什么每个Region有独立的Mappings？**
+
+Transform IR中的Region（如`transform.foreach`的循环体）定义了新的块参数，这些块参数的映射生命周期应局限于该Region。当Region处理完毕，RegionScope析构函数自动清理所有映射，防止内存泄漏和映射污染。
+
+#### 关键方法
+
+```cpp
+// 查询handle对应的payload操作（自动跳过nullptr/已删除操作）
+auto getPayloadOps(Value handle) const {
+  return llvm::make_filter_range(view, [](Operation *op) {
+    return op != nullptr;  // 延迟紧凑化：不立即删除，只跳过
+  });
+}
+
+// 为块参数关联payload实体（进入Region时调用）
+LogicalResult mapBlockArgument(BlockArgument arg,
+                               ArrayRef<MappedValue> values);
+```
+
+**延迟紧凑化的权衡**：用内存换O(1)删除速度。被删除操作留nullptr占位，迭代时自动跳过，避免频繁重新分配。
 
 ### 3.3 Transform 类型接口详解
 
@@ -360,11 +484,11 @@ virtual DiagnosedSilenceableFailure apply(
 
 **参数说明：**
 
-| 参数 | 类型 | 作用 |
+| 参数       | 职责                  | WHY 这样设计                              |
 |------|------|------|
-| `rewriter` | `TransformRewriter&` | 用于修改 Payload IR 的重写器 |
-| `results` | `TransformResults&` | 填充转换结果的容器 |
-| `state` | `TransformState&` | 访问 Handle 映射的状态对象 |
+| `rewriter` | 所有IR修改必须通过它  | 支持撤销、冲突检测、通知机制              |
+| `results`  | 报告新handle的映射    | 与state分离，支持原子性：失败时不提交结果 |
+| `state`    | 查询输入的payload映射 | 只读访问，防止apply()直接修改全局状态     |
 
 **实现示例：**
 ```cpp
@@ -395,6 +519,67 @@ DiagnosedSilenceableFailure MyTransformOp::apply(
 
   return DiagnosedSilenceableFailure::success();
 }
+```
+
+### 3.5 RaggedArray：不规则二维数组
+
+用于`topLevelMappedValues`的存储，每行长度可以不同：
+
+```cpp
+class RaggedArray<T> {
+  SmallVector<std::pair<size_t, size_t>> slices;  // (offset, length) 偏移量表
+  SmallVector<T> storage;                          // 所有元素的连续存储
+};
+```
+
+**为什么不用`Vec<Vec<T>>`？**
+
+单一连续存储 + 偏移量表比多次动态分配：
+
+- 减少内存碎片和分配开销
+- 缓存友好，CPU预取效率更高
+- 支持`replace(pos, elements)`就地修改，自动更新后续偏移量
+
+### 3.6 DiagnosedSilenceableFailure：三态错误处理
+
+#### 三种状态
+
+```
+成功（success）
+  ↓ 所有变换正常完成
+可沉默失败（silenceable failure）
+  ↓ 变换无法应用，但不是IR错误（如优化条件不满足）
+  ↓ 容器操作可以选择忽略并继续
+确定失败（definite failure）
+  ↓ 不可恢复的错误（如IR非法、类型不匹配）
+  ↓ 必须立即中止
+```
+
+#### 内部设计
+
+```cpp
+class DiagnosedSilenceableFailure {
+  SmallVector<Diagnostic, 1> diagnostics;  // 诊断消息（非空 = silenceable failure）
+  LogicalResult result;                     // success/failure（只在diagnostics为空时有意义）
+};
+```
+
+**状态判断逻辑：**
+
+- `succeeded()` = `result == success && diagnostics.empty()`
+- `isDefiniteFailure()` = `result == failure && diagnostics.empty()`
+- `isSilenceableFailure()` = `!diagnostics.empty()`
+
+**WHY 使用`[[nodiscard]]`：** 强制调用者显式处理返回值，防止silenceable failure被悄悄丢弃（这是常见的安全漏洞）。
+
+**两种"处理"方式：**
+
+```cpp
+// 方式1：升级为错误并报告
+LogicalResult result = failure.checkAndReport();
+
+// 方式2：忽略（消除）silenceable failure
+(void)failure.silence();
 ```
 
 ---
@@ -549,49 +734,185 @@ virtual DiagnosedSilenceableFailure checkPayload(
 
 ## 5. 核心操作详解
 
-### 5.1 transform.sequence - 转换序列
+### 5.1 transform.sequence / transform.named_sequence - 转换序列
 
-**语法：**
+#### 5.1.1 transform.sequence（旧版本，不建议使用）
+
+**sequence** 是基础的顺序执行容器，**按顺序执行**一组变换操作，`failure_propagation_mode`控制错误处理：
+
 ```mlir
-transform.sequence failures(propagate|suppress) {
-^bb0(%root: !transform.any_op):
-  // 转换操作序列
-  transform.yield %result : !transform.any_op
+// Propagate模式（严格）：任何失败立即中止
+transform.sequence %root : !transform.any_op failures(propagate) {
+^bb0(%arg0: !transform.any_op):
+  %0 = transform.structured.match ... in %arg0 : ...
+  transform.structured.tile_using_for %0 tile_sizes [4, 4] : ...
+}
+
+// Suppress模式（容错）：忽略silenceable failure继续执行
+transform.sequence %root : !transform.any_op failures(suppress) {
+^bb0(%arg0: !transform.any_op):
+  // 如果这里失败（silenceable），继续执行下一个操作
+  transform.optional_optimization %arg0 : !transform.any_op
 }
 ```
 
-**参数：**
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `failure_propagation_mode` | 属性 | `propagate` 或 `suppress` |
-| `root` | 可选 Handle | 顶层操作句柄 |
+**WHY两种模式？** 用于不同场景：
 
-**返回值：** 变长的 Handle 列表（由 yield 产生）
+- Propagate：关键变换，任何失败都不可接受
+- Suppress：试探性优化，部分失败可以接受
 
-**WHY 需要 sequence：**
-- 组织多个转换操作
-- 控制错误传播行为
-- 提供作用域隔离
+**SequenceOp::apply 执行流程：**
 
-**使用示例：**
+```
+1. 创建RegionScope（隔离block argument命名空间）
+2. 映射block arguments到payload
+3. 顺序执行body中的每个Transform op：
+   a. definite failure → 立即返回
+   b. silenceable failure + propagate → 转发失败，停止执行
+   c. silenceable failure + suppress → 忽略，继续
+4. 转发yield操作数（只在成功时）
+```
+
+#### 5.1.2 transform.named_sequence（新版本，建议使用）
+
+**named_sequence** 是可复用的Transform库函数，相当于**定义一个函数**，可以被多次调用：
+
+```mlir
+module attributes { transform.with_named_sequence } {
+  // 定义库函数
+  transform.named_sequence @tile_and_vectorize(
+      %op: !transform.any_op {transform.consumed}) {
+    %tiled, %loops = transform.structured.tile_using_for %op tile_sizes [4] : ...
+    transform.structured.vectorize %tiled : !transform.any_op
+    transform.yield
+  }
+
+  // 主入口点
+  transform.named_sequence @__transform_main(%root: !transform.any_op) {
+    %matmul = transform.structured.match ops{["linalg.matmul"]} in %root : ...
+    // 调用库函数
+    transform.include @tile_and_vectorize failures(propagate) (%matmul) : ...
+    transform.yield
+  }
+}
+```
+
+**WHY 禁止递归？**
+
+1. Transform的handle消费验证依赖静态分析，递归会导致无穷展开
+2. 解释器不需要处理栈溢出或循环检测，设计更简单
+3. 禁止递归不影响大多数实际使用场景（变换通常是有界的）
+
+### 5.2 transform.foreach / transform.foreach_match - 遍历
+
+#### 5.2.1 transform.foreach
+
+Handle（句柄）可能指向**多个 op**，`foreach` 对每一个**单独处理**：
+
 ```mlir
 transform.sequence failures(propagate) {
 ^bb0(%root: !transform.any_op):
-  // 匹配所有循环
-  %loops = transform.loop.match "scf.for" in %root
-      : (!transform.any_op) -> !transform.any_op
+  // 匹配所有 linalg.generic（可能有多个）
+  %generics = transform.structured.match ops{["linalg.generic"]} in %root
+    : (!transform.any_op) -> !transform.any_op
 
-  // 应用分块
-  %tiled = transform.loop.tile %loops tile_size = 32
-
-  // 应用向量化
-  transform.vectorize %tiled
-
-  transform.yield %tiled : !transform.any_op
+  // 对每一个 generic 单独 tile
+  transform.foreach %generics : !transform.any_op {
+  ^bb0(%single_generic: !transform.any_op):
+    %tiled, %loops = transform.structured.tile_using_for %single_generic [2, 4]
+      : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+  }
 }
 ```
 
-### 5.2 transform.match.ops / transform.structured.match - 操作匹配
+**为什么需要 foreach？** 
+
+```
+%generics 可能指向：
+  [linalg.generic #1,
+   linalg.generic #2,
+   linalg.generic #3]
+--> 不用 foreach → 整体处理，tile 参数对所有 op 统一生效
+--> 用 foreach   → 每个 op 独立进入 body，可以单独决策
+```
+
+**ForeachOp::apply 的关键设计：**
+
+```cpp
+// 关键1：提前快照所有payloads，防止迭代中映射被修改
+SmallVector<SmallVector<MappedValue>> payloads;
+detail::prepareValueMappings(payloads, getTargets(), state);
+
+for (size_t i = 0; i < numIterations; i++) {
+  // 关键2：每次迭代创建独立scope，防止跨迭代污染
+  auto scope = state.make_region_scope(getBody());
+
+  // 关键3：每次迭代只映射单个元素
+  state.mapBlockArgument(blockArg, {payloads[argIdx][i]});
+
+  // 执行body...
+
+  // 关键4：累积yield结果（append，不是覆盖）
+  llvm::append_range(resTuple, state.getPayloadOps(yieldOperand));
+}
+```
+
+#### 5.2.2 transform.foreach_match
+
+**foreach_match** 是模式驱动的迭代，用于"匹配特定类型op，然后对每个匹配应用变换"：
+
+```mlir
+// 匹配器：检查是否是scf.for
+transform.named_sequence @match_for(
+    %arg0: !transform.any_op {transform.readonly}) -> !transform.any_op {
+  transform.match.operation_name %arg0 ["scf.for"] : !transform.any_op
+  transform.yield %arg0 : !transform.any_op
+}
+
+// 动作：对scf.for应用循环分割
+transform.named_sequence @peel(
+    %arg0: !transform.op<"scf.for"> {transform.consumed}) {
+  transform.loop.peel %arg0 : (!transform.op<"scf.for">) -> ...
+  transform.yield
+}
+
+// 主变换
+transform.foreach_match in %root
+    @match_for -> @peel
+    : (!transform.any_op) -> !transform.any_op
+```
+
+**foreach_match 的执行语义：**
+
+```
+for each op in root (post-order walk):
+  for each (matcher, action) pair:
+    if matcher(op) succeeds:
+      apply action(matcher_results)
+      break  // 跳过其他matcher
+```
+
+#### 综合对比上述4个Op
+
+```
+假如有一堆 op 需要变换：
+
+sequence        → 写死步骤，全部统一处理
+                  [match → tile → vectorize → ...]
+
+named_sequence  → 把上面的步骤封装成函数，哪里需要哪里调用
+                  @my_pipeline(%op) { ... }
+
+foreach         → 有多个 op，想对每个单独跑同一套逻辑
+                  for each op in handles: { tile(op) }
+
+foreach_match   → 有多个 op，不同类型走不同逻辑
+                  for each op in root:
+                    if matmul → @handle_matmul
+                    if conv   → @handle_conv
+```
+
+### 5.3 transform.match.ops / transform.structured.match - 操作匹配
 
 **语法：**
 ```mlir
@@ -635,7 +956,7 @@ transform.sequence failures(propagate) {
     : (!transform.any_op) -> !transform.any_op
 ```
 
-### 5.3 transform.structured.tile - 循环分块
+### 5.4 transform.structured.tile - 循环分块
 
 **语法：**
 ```mlir
@@ -672,7 +993,7 @@ transform.sequence failures(propagate) {
     : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
 ```
 
-### 5.4 transform.structured.vectorize - 向量化
+### 5.5 transform.structured.vectorize - 向量化
 
 **语法：**
 ```mlir
@@ -712,7 +1033,7 @@ transform.structured.vectorize %tiled vector_sizes [4, 8]
     : (!transform.any_op) -> !transform.any_op
 ```
 
-### 5.5 transform.print - 调试输出
+### 5.6 transform.print - 调试输出
 
 **语法：**
 ```mlir
@@ -755,7 +1076,7 @@ transform.sequence failures(propagate) {
 }
 ```
 
-### 5.6 transform.verify - 验证 IR
+### 5.7 transform.verify - 验证 IR
 
 **语法：**
 ```mlir
@@ -792,7 +1113,7 @@ transform.sequence failures(propagate) {
 }
 ```
 
-### 5.7 transform.alternatives - 备选方案
+### 5.8 transform.alternatives - 备选方案
 
 **语法：**
 ```mlir
@@ -847,117 +1168,118 @@ transform.sequence failures(propagate) {
 
 ---
 
-## 6. 源码实现：TransformState
+## 6. 解释器（InterpreterPass）与 Pass 系统
 
-### 6.1 核心数据结构
+### 6.1 Transform 解释器架构
 
-TransformState 是 Transform 方言执行的核心状态管理类，负责维护 Transform IR 与 Payload IR 之间的映射关系。
-
-```cpp
-// TransformInterfaces.h (简化版)
-class TransformState {
-public:
-  TransformState(Region *region, Operation *payloadRoot,
-                 const RaggedArray<MappedValue> &extraMappings = {},
-                 const TransformOptions &options = TransformOptions());
-
-private:
-  // Handle → Payload 操作的映射
-  DenseMap<Region *, std::unique_ptr<Mappings>> mappings;
-
-  // 区域栈：跟踪当前处理的区域
-  SmallVector<RegionScope *> regionStack;
-
-  // 扩展数据：支持用户自定义状态
-  DenseMap<TypeID, std::unique_ptr<Extension>> extensions;
-
-  // 选项：配置 Transform 执行行为
-  TransformOptions options;
-};
+```
+用户调用
+  ↓
+InterpreterPass::runOnOperation()
+  ├─ 获取预加载的Transform库（getPreloadedTransformModule）
+  ├─ 定位Payload根（debugPayloadRootTag 或 Pass锚点操作）
+  ├─ 查找Transform入口点（findTransformEntryPoint → @__transform_main）
+  ├─ 解析绑定参数（parseArguments → RaggedArray<MappedValue>）
+  └─ 执行Transform（applyTransformNamedSequence）
+       ├─ 必要时合并符号表（mergeSymbolsInto）
+       └─ 创建TransformState，逐op解释执行
 ```
 
-### 6.2 Mappings 结构
+### 6.2 findTransformEntryPoint：入口点查找
 
 ```cpp
-// TransformInterfaces.cpp
-struct TransformState::Mappings {
-  // 正向映射：Transform Value → Payload Operation
-  DenseMap<Value, SmallVector<Operation *>> direct;
+// 两层搜索策略
+NamedSequenceOp findTransformEntryPoint(Operation *root,
+                                        ModuleOp module,
+                                        StringRef entryPoint) {
+  NamedSequenceOp found;
 
-  // 反向映射：Payload Operation → Transform Value
-  DenseMap<Operation *, SmallVector<Value>> reverse;
+  // 第一层：在root中前序遍历查找
+  root->walk<WalkOrder::PreOrder>([&](NamedSequenceOp op) {
+    if (op.getSymName() == entryPoint) {
+      found = op;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
 
-  // 值映射：Transform Value → Payload Value
-  DenseMap<Value, SmallVector<Value>> values;
+  // 第二层：在外部module（预加载库）中查找
+  if (!found && module)
+    module->walk<WalkOrder::PreOrder>([&](NamedSequenceOp op) { ... });
 
-  // 参数映射：Transform Value → Payload Attribute
-  DenseMap<Value, SmallVector<Attribute>> params;
-};
-```
-
-### 6.3 核心方法：setPayloadOps
-
-```cpp
-LogicalResult TransformState::setPayloadOps(Value value,
-                                            ArrayRef<Operation *> targets) {
-  // 步骤 1: 断言检查
-  assert(value != kTopLevelValue && "cannot set payload ops for the top-level");
-
-  // 步骤 2: 类型检查
-  auto iface = llvm::cast<TransformHandleTypeInterface>(value.getType());
-
-  // 步骤 3: 类型验证
-  DiagnosedSilenceableFailure result =
-      iface.checkPayload(value.getLoc(), targets);
-
-  // 步骤 4: 建立映射
-  if (failed(result.checkAndReport()))
-    return failure();
-
-  mappings[region]->direct[value] = targets;
-  for (Operation *op : targets) {
-    mappings[region]->reverse[op].push_back(value);
-  }
-
-  return success();
+  return found;
 }
 ```
 
-**WHY 需要双向映射：**
-- 正向映射：从 Transform IR 查找 Payload 操作
-- 反向映射：从 Payload 操作查找 Transform Handle（用于失效检测）
+**默认入口点名称：** `__transform_main`（常量`kTransformEntryPointSymbolName`）
 
-### 6.4 RegionScope - 区域作用域管理
+### 6.3 PreloadLibraryPass：库预加载
 
-```cpp
-class TransformState::RegionScope {
-public:
-  RegionScope(TransformState &state, Region &region)
-      : state(state), region(region) {
-    // 进入区域时：压栈
-    state.regionStack.push_back(this);
-  }
+**WHY 需要预加载？**
 
-  ~RegionScope() {
-    // 退出区域时：弹栈
-    assert(state.regionStack.back() == this);
-    state.regionStack.pop_back();
-  }
+Transform库（命名序列集合）可能跨多个`.mlir`文件定义，解释器需要统一符号表来解析序列调用。相比在Pass执行时逐次加载，预加载避免重复解析。
 
-private:
-  TransformState &state;
-  Region &region;
-};
+**执行流程：**
+
+```
+1. expandPathsToMLIRFiles：展开目录路径，收集所有.mlir文件
+2. 逐文件解析：parseTransformModuleFromFile
+3. 合并符号表：mergeSymbolsInto（创建虚拟根模块 __transform）
+4. 加载到方言：TransformDialect::loadIntoLibraryModule
 ```
 
-**WHY 需要区域作用域：**
-- 支持嵌套的 Transform IR 区域
-- 自动管理 Handle 映射的生命周期
-- 确保退出区域时清理状态
+**跨文件符号解析：** 库A中的named_sequence可以调用库B中的sequence，通过合并后的统一符号表实现。
+
+### 6.4 CheckUses Pass：use-after-free 检测
+
+Transform Handle类似于C++中的指针——当被操作"消费"（delete）后，就不应再使用。CheckUses Pass进行静态分析：
+
+**核心算法（TransformOpMemFreeAnalysis）：**
+
+```
+1. 收集所有"释放点"：freedBy[handle] = {可能释放它的操作集合}
+
+2. 对每个handle的每个使用点，检查isUseLive：
+   a. 建立从定义点到使用点的祖先链
+   b. 检查祖先链中是否存在释放操作
+   c. 在控制流中：如果任意分支释放了handle，汇聚点视为失效
+
+3. 保守性：may-free即报警（宁可false positive，不遗漏true positive）
+```
+
+**控制流示例：**
+
+```mlir
+^bb1:
+  transform.consume %0 : !transform.any_op  // 在bb1中释放
+  cf.br ^bb3
+
+^bb2:
+  cf.br ^bb3
+
+^bb3:
+  // 警告：%0可能在bb1路径中被释放
+  transform.use %0 : !transform.any_op  // use-after-free!
+```
+
+### 6.5 InferEffects Pass：自动推断副作用
+
+手动为每个named_sequence参数标注`{transform.readonly}`或`{transform.consumed}`容易出错。InferEffects Pass自动分析：
+
+```
+1. 遍历所有FunctionOpInterface操作（named_sequence）
+2. 对每个块参数：
+   - 检查是否被传入某个"消费性"操作的operand
+   - 如果是 → 标注 {transform.consumed}
+   - 否则 → 标注 {transform.readonly}
+3. 设置对应属性
+```
 
 ---
 
-## 7. 源码实现：TransformDialectExtension
+## 7. 扩展机制：TransformDialectExtension
+
+Transform方言可以通过`TransformDialectExtension`机制向其他方言注入额外的操作，解耦**核心方言**与**特定变换**。
 
 ### 7.1 扩展机制背景与动机
 
@@ -981,13 +1303,26 @@ private:
 ```cpp
 // TransformDialect.h
 template <typename DerivedTy>
-class TransformDialectExtension {
+class TransformDialectExtension 
+    : public DialectExtension<DerivedTy, TransformDialect, ExtraDialects...> {
 public:
-  // 初始化方法
-  void init() {
-    // 调用派生类的实现
-    static_cast<DerivedTy *>(this)->apply();
+  void apply(MLIRContext *context, TransformDialect *transformDialect,
+             ExtraDialects*...) const {
+    // 加载dependent dialects
+    for (const DialectLoader &loader : dialectLoaders)
+      loader(context);
+
+    // 执行initializers（注册新操作）
+    for (const Initializer &init : initializers)
+      init(transformDialect);
   }
+
+protected:
+  explicit TransformDialectExtension(bool buildOnly = false)
+      : buildOnly(buildOnly) {
+    // 调用派生类的实现
+    static_cast<DerivedTy *>(this)->init();
+  } 
 
   // 注册操作
   template <typename... OpTys>
@@ -1004,9 +1339,22 @@ public:
 protected:
   TransformDialect *dialect;
 };
+
+// Build-Only模式（只构建IR，不执行，不会产生未声明依赖的方言）
+template <typename DerivedTy>
+class BuildOnly : public DerivedTy {
+  BuildOnly() : DerivedTy(/*buildOnly=*/true) {}
+};
 ```
 
+**注入的操作必须：**
+
+1. 实现`TransformOpInterface`（或`PatternDescriptorOpInterface`等等价接口）
+2. 实现`MemoryEffectsOpInterface`
+3. 使用点分前缀命名（如`transform.affine.reschedule`）
+
 **WHY 使用 CRTP：**
+
 - 编译时多态，避免虚函数开销
 - 类型安全的扩展注册
 - 简洁的 API 设计
@@ -1070,32 +1418,161 @@ void registerTypes() {
 }
 ```
 
-### 7.4 完整扩展示例：LinalgTransformDialectExtension
+### 7.4 Transform官方内置扩展
+
+#### 7.4.1 DebugExtension
+
+提供Transform程序内部的观测能力：
+
+```mlir
+// 在操作位置发出Remark
+transform.debug.emit_remark_at %op, "found target" : !transform.any_op
+
+// 将参数值作为Remark输出
+transform.debug.emit_param_as_remark %tile_size, "tile size" at %op
+    : !transform.param<i64>, !transform.any_op
+```
+
+**用途：** 调试Transform脚本，无需停止执行即可观察中间状态。
+
+#### 7.4.2 LoopExtension
+
+```mlir
+// 循环不变量外提
+transform.loop.hoist_loop_invariant_subsets %loop
+    : (!transform.op<"scf.for">) -> !transform.op<"scf.for">
+
+// 循环分割（将最后一次迭代分离）
+%main, %remainder = transform.loop.peel %loop
+    : (!transform.op<"scf.for">) -> (!transform.any_op, !transform.any_op)
+
+// 循环展开
+transform.loop.unroll %loop { factor = 4 }
+    : !transform.op<"scf.for">
+```
+
+#### 7.4.3 PDLExtension
+
+将PDL（Pattern Description Language）与Transform方言集成，支持声明式的模式匹配：
+
+```mlir
+transform.with_pdl_patterns %root : !transform.any_op {
+^bb0(%arg: !transform.any_op):
+  // 定义PDL模式
+  pdl.pattern @match_matmul_attrA : benefit(1) {
+    %attr = attribute
+    %0 = operation "linalg.matmul" {"test.attrA" = %attr} -> ...
+    rewrite %0 with "transform.dialect"
+  }
+
+  transform.sequence %arg failures(propagate) {
+  ^bb1(%root: !transform.any_op):
+    // 使用PDL模式匹配
+    %matches = pdl_match @match_matmul_attrA in %root : ...
+    // 对匹配的op应用变换
+    transform.structured.tile_using_for %matches tile_sizes [4,4] : ...
+  }
+}
+```
+
+**PDLExtension的内部机制：**
+
+1. `PatternApplicatorExtension`：延迟编译PDL模式（首次请求时才编译）
+2. `PDLMatchOp`：遍历payload，应用PDL模式，收集匹配的操作
+
+#### 7.4.4 TuneExtension
+
+支持超参数搜索和自动调优：
+
+```mlir
+// 声明一个可调参数
+%tile_size = transform.tune.knob<"tile_size"> = #16
+    from options = [8, 16, 32] -> !transform.param<i64>
+
+// 使用该参数
+transform.structured.tile_using_for %op tile_sizes [%tile_size] : ...
+```
+
+**使用场景：** 外部搜索框架（如AutoTVM）遍历不同的`selected`值，评估编译结果的性能。
+
+#### 7.4.5 IRDLExtension
+
+IRDL（IR Definition Language）是MLIR中用于**动态描述操作约束**的方言。IRDLExtension将IRDL与Transform方言结合，提供无需注册操作即可按约束匹配的能力。
+
+**唯一操作：`transform.irdl.collect_matching`**
+
+```mlir
+// 用IRDL描述约束，收集所有满足条件的操作
+%matched = transform.irdl.collect_matching in %root
+    : (!transform.any_op) -> !transform.any_op {
+^bb0(%arg: !transform.any_op):
+  irdl.dialect @test {
+    irdl.operation @whatever {
+      // 约束：结果类型必须是 i32 或 i64
+      %t_i32 = irdl.is i32
+      %t_i64 = irdl.is i64
+      %t_any  = irdl.any_of(%t_i32, %t_i64)
+      irdl.results(foo: %t_any)
+    }
+  }
+}
+// %matched 持有所有结果类型为 i32 或 i64 的 test.whatever 操作
+```
+
+来自测试用例 `irdl.mlir`：上面的Transform脚本对两个 `test.whatever` 操作发出"matched"备注——结果类型为 `f32` 的那个不匹配，被自动排除。
+
+**与PDLExtension的区别：**
+
+| 维度           | PDLExtension                 | IRDLExtension             |
+| -------------- | ---------------------------- | ------------------------- |
+| 描述方式       | PDL语言（图形匹配）          | IRDL语言（类型/属性约束） |
+| 匹配粒度       | 操作+操作数+结果的整体图匹配 | 单个操作的类型约束匹配    |
+| 适用场景       | 复杂的数据流模式             | 按类型系统约束筛选op      |
+| 是否需要注册op | 否                           | 否                        |
+
+**WHY需要IRDLExtension？**
+
+PDL擅长匹配"结构"（操作之间的连接关系），而IRDL擅长描述"约束"（类型系统层面的限定）。当只需要按类型约束筛选操作时，IRDL比PDL更简洁直观。例如"找出所有输出为向量类型且元素为浮点数的操作"，用IRDL的类型约束比PDL的图模式更自然。
+
+**内部实现：**
 
 ```cpp
-// LinalgTransformDialectExtension.h
-class LinalgTransformDialectExtension
-    : public ::mlir::transform::TransformDialectExtension<
-          LinalgTransformDialectExtension> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
-      LinalgTransformDialectExtension)
+// IRDLCollectMatchingOp::apply 的核心逻辑
+DiagnosedSilenceableFailure IRDLCollectMatchingOp::apply(...) {
+  // 1. 从body中提取IRDL操作描述（DialectOp + OperationOp）
+  auto dialect = cast<irdl::DialectOp>(getBody().front().front());
+  irdl::OperationOp operation = *body.getOps<irdl::OperationOp>().begin();
 
-  using Base::Base;
+  // 2. 根据IRDL描述创建验证器（不注册操作，只创建约束检查器）
+  auto verifier = irdl::createVerifier(operation, {}, {});
 
-  void init() {
-    // 声明依赖
-    declareDependentDialect<LinalgDialect>();
-    declareGeneratedDialect<SCFDialect>();
+  // 3. 注册空的诊断handler（抑制约束不匹配时产生的诊断，视为正常的"不匹配"）
+  auto handlerID = getContext()->getDiagEngine().registerHandler(
+      [](Diagnostic &) { return success(); });  // 吞掉所有诊断
 
-    // 注册操作
-    registerTransformOps<
-#define GET_OP_LIST
-#include "LinalgTransformOps.cpp.inc"
-    >();
-  }
-};
+  // 4. 遍历payload，逐个尝试验证
+  SmallVector<Operation *> matched;
+  for (Operation *payload : state.getPayloadOps(getRoot()))
+    payload->walk([&](Operation *target) {
+      if (succeeded(verifier(target)))
+        matched.push_back(target);  // 满足约束则收集
+    });
+
+  getContext()->getDiagEngine().eraseHandler(handlerID);
+  results.set(cast<OpResult>(getMatched()), matched);
+  return DiagnosedSilenceableFailure::success();
+}
 ```
+
+**关键设计：空诊断handler**
+
+IRDL验证器在约束不满足时会发出诊断（错误信息）。IRDLCollectMatchingOp需要的是"静默的约束测试"——不匹配不是错误，只是"筛掉了"。因此注册一个空handler吞掉所有诊断，验证失败只用返回值判断，不产生任何噪音。
+
+**当前限制（代码注释中标注）：**
+
+- body中只允许一个 `irdl.dialect` 操作
+- `irdl.dialect` 中只允许一个 `irdl.operation`
+- 暂不支持 `irdl.type` 和 `irdl.attribute`（TODO注释）
 
 ### 7.5 TransformDialectData - 扩展间通信机制
 
@@ -1182,6 +1659,33 @@ bool TransformDialect::isExtensionRequired(
 - 用户体验：无需手动加载
 - 按需加载：只加载需要的扩展
 - 避免循环依赖：延迟加载机制
+
+### 7.7 完整扩展示例：LinalgTransformDialectExtension
+
+```cpp
+// LinalgTransformDialectExtension.h
+class LinalgTransformDialectExtension
+    : public ::mlir::transform::TransformDialectExtension<
+          LinalgTransformDialectExtension> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      LinalgTransformDialectExtension)
+
+  using Base::Base;
+
+  void init() {
+    // 声明依赖
+    declareDependentDialect<LinalgDialect>();
+    declareGeneratedDialect<SCFDialect>();
+
+    // 注册操作
+    registerTransformOps<
+#define GET_OP_LIST
+#include "LinalgTransformOps.cpp.inc"
+    >();
+  }
+};
+```
 
 ---
 
