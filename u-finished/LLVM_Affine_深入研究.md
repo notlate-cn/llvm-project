@@ -1,6 +1,6 @@
 # 【MLIR】Affine 方言深入研究
 
-本文档基于[Claude Code + GLM4.7](https://www.cnblogs.com/notlate-cn/p/19452715) + [CodeReaderSkills](https://www.cnblogs.com/notlate-cn/p/19560365)完成。
+>  本文档基于[Claude Code + GLM4.7](https://www.cnblogs.com/notlate-cn/p/19452715) + [CodeReaderSkills](https://www.cnblogs.com/notlate-cn/p/19560365)完成。
 
 ## 1. 快速概览
 
@@ -1885,15 +1885,15 @@ std::optional<double> getAdditionalComputeFraction(
 > **疑问：是否要求srcForOp和dstForOp对应深度循环的上下界一致？**
 >
 > **答：**不需要强制要求上下界一致，因为**切片机制**已经处理了不一致的情况。
->   **computeSliceUnion**计算的是：在给定 `dstLoopDepth` 下，dst 的每个迭代需要 src 执行哪些迭代。这个切片约束本身就是仿射表达式，可以处理上下界不同的情况。
+> **computeSliceUnion**计算的是：在给定 `dstLoopDepth` 下，dst 的每个迭代需要 src 执行哪些迭代。这个切片约束本身就是仿射表达式，可以处理上下界不同的情况。
 >
 > ```mlir
 > affine.for %i = 0 to 10 {         // src，10次
->   affine.store %v, %A[%i * 2]
+> affine.store %v, %A[%i * 2]
 > }
 > 
 > affine.for %j = 0 to 20 {         // dst，20次，上界不同
->   %a = affine.load %A[%j]
+> %a = affine.load %A[%j]
 > }
 > ```
 >
@@ -1904,6 +1904,7 @@ std::optional<double> getAdditionalComputeFraction(
 >   1. `getMaxLoopDepth` 检查的是依赖方向，不检查上下界
 >   2. `isFusionProfitable` 会计算切片的计算量，上下界不同会影响冗余比例，可能导致融合被判断为不划算
 >   3. `isMaximal` 检查切片是否覆盖 src 的全部迭代空间——上下界不一致时切片通常不是 maximal，影响 src
+>
 >     能否被删除
 
 #### 源代码级深度解析
